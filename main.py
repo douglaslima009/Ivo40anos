@@ -45,7 +45,6 @@ void main() {
 
 CROSSHAIR_VERT = "#version 330 core\nlayout (location = 0) in vec2 aPos;\nvoid main() { gl_Position = vec4(aPos, 0.0, 1.0); }"
 CROSSHAIR_FRAG = "#version 330 core\nout vec4 FragColor;\nvoid main() { FragColor = vec4(0.0, 0.0, 0.0, 1.0); }"
-
 UI_VERT = """
 #version 330 core
 layout (location = 0) in vec2 aPos;
@@ -53,7 +52,6 @@ layout (location = 1) in vec2 aTexCoords;
 out vec2 TexCoords;
 void main() { gl_Position = vec4(aPos, 0.0, 1.0); TexCoords = aTexCoords; }
 """
-
 UI_FRAG = """
 #version 330 core
 out vec4 FragColor;
@@ -69,8 +67,16 @@ def carregar_modelo_completo(caminho_glb):
 
     partes = []
     for malha in dumped_meshes:
-        corrective_rotation = pyrr.matrix44.create_from_x_rotation(np.radians(-90.0))
-        malha.apply_transform(corrective_rotation)
+        cor_padrao = [0.5, 0.5, 0.5] 
+        try:
+            if hasattr(malha.visual, 'material') and hasattr(malha.visual.material, 'pbr_metallic_roughness'):
+                 pbr = malha.visual.material.pbr_metallic_roughness
+                 if pbr.base_color_factor is not None:
+                     cor_padrao = [pbr.base_color_factor[0], pbr.base_color_factor[1], pbr.base_color_factor[2]]
+            elif hasattr(malha.visual, 'kind') and malha.visual.kind == 'vertex':
+                c_avg = np.mean(malha.visual.vertex_colors, axis=0) / 255.0
+                cor_padrao = [c_avg[0], c_avg[1], c_avg[2]]
+        except: pass
 
         faces = malha.faces.flatten()
         vertices = np.array(malha.vertices[faces], dtype=np.float32)
@@ -85,7 +91,7 @@ def carregar_modelo_completo(caminho_glb):
         glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 24, ctypes.c_void_p(12))
         glEnableVertexAttribArray(1)
 
-        partes.append({'vao': vao, 'count': len(faces)})
+        partes.append({'vao': vao, 'count': len(faces), 'color': cor_padrao})
     return partes
 
 def criar_esfera_vao():
@@ -113,12 +119,7 @@ def criar_crosshair_vao():
     return vao, 4
 
 def criar_ui_quad_vao():
-    quad_data = np.array([
-        -0.8, -0.9, 0.0, 0.0, 
-         0.8, -0.9, 1.0, 0.0, 
-         0.8, -0.5, 1.0, 1.0, 
-        -0.8, -0.5, 0.0, 1.0
-    ], dtype=np.float32)
+    quad_data = np.array([-0.8, -0.9, 0.0, 0.0,  0.8, -0.9, 1.0, 0.0,  0.8, -0.5, 1.0, 1.0, -0.8, -0.5, 0.0, 1.0], dtype=np.float32)
     vao = glGenVertexArrays(1); vbo = glGenBuffers(1)
     glBindVertexArray(vao); glBindBuffer(GL_ARRAY_BUFFER, vbo)
     glBufferData(GL_ARRAY_BUFFER, quad_data.nbytes, quad_data, GL_STATIC_DRAW)
@@ -155,19 +156,34 @@ def main():
     pygame.init(); pygame.font.init(); pygame.mixer.init()
     largura, altura = 1024, 768
     tela = pygame.display.set_mode((largura, altura), DOUBLEBUF | OPENGL)
-    pygame.display.set_caption("O Farol do Mestre - VORTEX")
+    pygame.display.set_caption("IVO 40 ANOS")
     pygame.event.set_grab(True); pygame.mouse.set_visible(False)
     fonte_ui = pygame.font.SysFont('Consolas', 28, bold=True)
     
+    # --- CARREGAMENTO INDEPENDENTE DE ÁUDIOS ---
+    dialogo_blip = som_tiro = som_acerto = som_morte = None
+
     try:
-        dialogo_blip = pygame.mixer.Sound("blip.wav")
-        dialogo_blip.set_volume(0.4)
-        som_tiro = pygame.mixer.Sound("shoot.wav")
-        som_acerto = pygame.mixer.Sound("hit.wav")
-        som_morte = pygame.mixer.Sound("death.wav")
+        dialogo_blip = pygame.mixer.Sound("blip3.wav")
+        # Ajuste o volume aqui se ficar muito alto (0.0 a 1.0)
+        dialogo_blip.set_volume(0.8) 
     except Exception as e:
-        print(f"AVISO AUDIO: {e}")
-        dialogo_blip = som_tiro = som_acerto = som_morte = None
+        print(f"Aviso: blip.wav não encontrado. {e}")
+
+    try: 
+        som_tiro = pygame.mixer.Sound("shoot.wav")
+    except: 
+        pass
+
+    try: 
+        som_acerto = pygame.mixer.Sound("hit.wav")
+    except: 
+        pass
+
+    try: 
+        som_morte = pygame.mixer.Sound("death.wav")
+    except: 
+        pass
 
     shader_phong = compileProgram(compileShader(PHONG_VERT, GL_VERTEX_SHADER), compileShader(PHONG_FRAG, GL_FRAGMENT_SHADER))
     shader_crosshair = compileProgram(compileShader(CROSSHAIR_VERT, GL_VERTEX_SHADER), compileShader(CROSSHAIR_FRAG, GL_FRAGMENT_SHADER))
@@ -182,8 +198,24 @@ def main():
     glEnable(GL_DEPTH_TEST); glEnable(GL_CULL_FACE); glLineWidth(2.0)
     
     projection = pyrr.matrix44.create_perspective_projection_matrix(45.0, largura/altura, 0.1, 100.0)
-    model_hornet = pyrr.matrix44.multiply(pyrr.matrix44.create_from_scale([2.0]*3), pyrr.matrix44.create_from_translation([0.0, 0.0, -5.0]))
-    model_porta = pyrr.matrix44.multiply(pyrr.matrix44.create_from_scale([0.1]*3), pyrr.matrix44.create_from_translation([0.0, 0.0, -25.0]))
+    
+    # --- MATRIZES DE TRANSFORMACAO (AJUSTE AQUI SE NECESSARIO) ---
+    
+    # HORNET: Levantando (+90 no X) e virando pra frente (+180 no Y)
+    escala_h = pyrr.matrix44.create_from_scale([2.0, 2.0, 2.0])
+    rot_x_h = pyrr.matrix44.create_from_x_rotation(np.radians(0.0))  # Mude para -90.0 se ficar de ponta-cabeça
+    rot_y_h = pyrr.matrix44.create_from_y_rotation(np.radians(0.0)) # Mude para 0.0 se ficar de costas
+    rot_h = pyrr.matrix44.multiply(rot_x_h, rot_y_h)
+    trans_h = pyrr.matrix44.create_from_translation([0.0, -1.0, -5.0]) # Desceu um pouco no eixo Y (-1.0)
+    model_hornet = pyrr.matrix44.multiply(escala_h, rot_h)
+    model_hornet = pyrr.matrix44.multiply(model_hornet, trans_h)
+    
+    # PORTA: Levantando (+90 no X)
+    escala_p = pyrr.matrix44.create_from_scale([0.5, 0.5, 0.5])
+    rot_x_p = pyrr.matrix44.create_from_x_rotation(np.radians(0.0)) # Mude para -90.0 se ficar de ponta-cabeça
+    trans_p = pyrr.matrix44.create_from_translation([0.0, -1.0, -25.0])
+    model_porta = pyrr.matrix44.multiply(escala_p, rot_x_p)
+    model_porta = pyrr.matrix44.multiply(model_porta, trans_p)
     
     cam_pos, cam_front, cam_up = np.array([0.0, 1.5, 2.0]), np.array([0.0, 0.0, -1.0]), np.array([0.0, 1.0, 0.0])
     yaw, pitch, sensibilidade, speed = -90.0, 0.0, 0.1, 4.0
@@ -276,12 +308,13 @@ def main():
         if current_room == 0:
             glUniformMatrix4fv(glGetUniformLocation(shader_phong, "model"), 1, GL_FALSE, model_hornet)
             for parte in vao_hornet:
+                # Mantivemos a lógica de pintura em vermelho/cinza para garantir que a cor funcione
                 glUniform3f(glGetUniformLocation(shader_phong, "objectColor"), 0.8, 0.1, 0.1) 
                 glBindVertexArray(parte['vao']); glDrawArrays(GL_TRIANGLES, 0, parte['count'])
             
             glUniformMatrix4fv(glGetUniformLocation(shader_phong, "model"), 1, GL_FALSE, model_porta)
             for parte in vao_porta:
-                glUniform3f(glGetUniformLocation(shader_phong, "objectColor"), 1.0, 1.0, 1.0) 
+                glUniform3f(glGetUniformLocation(shader_phong, "objectColor"), 0.5, 0.5, 0.6) 
                 glBindVertexArray(parte['vao']); glDrawArrays(GL_TRIANGLES, 0, parte['count'])
             
         elif current_room == 1:
@@ -294,6 +327,7 @@ def main():
             glUseProgram(shader_crosshair)
             glBindVertexArray(vao_crosshair); glDrawArrays(GL_LINES, 0, num_vert_crosshair)
 
+# --- SISTEMA DE UI (CAIXA DE TEXTO VISUAL E ÁUDIO) ---
         if dialogo_ativo and current_room == 0:
             time_di += dt
             texto_real = dialogos_reais[current_di]
@@ -303,7 +337,12 @@ def main():
                 if textura_ui is not None: glDeleteTextures(1, [textura_ui]) 
                 textura_ui = gerar_textura_texto(texto_atual_exibido, fonte_ui)
                 
-                if texto_real[char_index_di] != " " and dialogo_blip and random.random() < 0.5: dialogo_blip.play()
+                # --- A MÁGICA DO ÁUDIO AQUI ---
+                if texto_real[char_index_di] != " " and dialogo_blip is not None:
+                    # Só toca se o canal 0 já tiver terminado de falar o blip anterior
+                    if not pygame.mixer.Channel(0).get_busy():
+                        pygame.mixer.Channel(0).play(dialogo_blip)
+                
                 char_index_di += 1; time_di = 0.0
                 
             elif char_index_di == len(texto_real) and time_di > 1.0: 
