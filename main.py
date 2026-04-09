@@ -60,7 +60,15 @@ uniform sampler2D textTexture;
 void main() { FragColor = texture(textTexture, TexCoords); }
 """
 
-# --- 2. FUNCOES DE SUPORTE ---
+# NOVO SHADER PARA O FADE PRETO
+FADE_FRAG = """
+#version 330 core
+out vec4 FragColor;
+uniform float alpha;
+void main() { FragColor = vec4(0.0, 0.0, 0.0, alpha); }
+"""
+
+# --- 2. FUNÇÕES DE SUPORTE ---
 def carregar_modelo_completo(caminho_glb):
     cena = trimesh.load(caminho_glb)
     dumped_meshes = cena.dump() if isinstance(cena, trimesh.Scene) else [cena]
@@ -129,6 +137,41 @@ def criar_ui_quad_vao():
     glEnableVertexAttribArray(1)
     return vao
 
+def criar_quad_generico_vao(largura=1.0, altura=1.0):
+    # Cria um plano 2D customizável para o Fade e para a Foto
+    quad_data = np.array([
+        -largura, -altura, 0.0, 0.0,
+         largura, -altura, 1.0, 0.0,
+         largura,  altura, 1.0, 1.0,
+        -largura,  altura, 0.0, 1.0
+    ], dtype=np.float32)
+    vao = glGenVertexArrays(1); vbo = glGenBuffers(1)
+    glBindVertexArray(vao); glBindBuffer(GL_ARRAY_BUFFER, vbo)
+    glBufferData(GL_ARRAY_BUFFER, quad_data.nbytes, quad_data, GL_STATIC_DRAW)
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, ctypes.c_void_p(0))
+    glEnableVertexAttribArray(0)
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, ctypes.c_void_p(8))
+    glEnableVertexAttribArray(1)
+    return vao
+
+def carregar_textura_imagem(caminho):
+    try:
+        surface = pygame.image.load(caminho).convert_alpha()
+        
+        # O 'True' aqui no final já faz a inversão correta para o OpenGL!
+        img_data = pygame.image.tostring(surface, "RGBA", True) 
+        
+        width, height = surface.get_size()
+        tex_id = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, tex_id)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, img_data)
+        return tex_id, width / height # Retorna o ID da textura e o Aspect Ratio
+    except Exception as e:
+        print(f"Aviso: Não encontrou {caminho}. {e}")
+        return None, 1.0
+
 def gerar_textura_texto(texto, fonte):
     surface = pygame.Surface((800, 150), pygame.SRCALPHA)
     surface.fill((0, 0, 0, 200)) 
@@ -150,7 +193,7 @@ def gerar_textura_texto(texto, fonte):
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 800, 150, 0, GL_RGBA, GL_UNSIGNED_BYTE, text_data)
     return tex_id
 
-# --- 3. APLICACAO PRINCIPAL ---
+# --- 3. APLICAÇÃO PRINCIPAL ---
 def main():
     pygame.mixer.pre_init(44100, -16, 2, 512)
     pygame.init(); pygame.font.init(); pygame.mixer.init()
@@ -182,12 +225,19 @@ def main():
     shader_phong = compileProgram(compileShader(PHONG_VERT, GL_VERTEX_SHADER), compileShader(PHONG_FRAG, GL_FRAGMENT_SHADER))
     shader_crosshair = compileProgram(compileShader(CROSSHAIR_VERT, GL_VERTEX_SHADER), compileShader(CROSSHAIR_FRAG, GL_FRAGMENT_SHADER))
     shader_ui = compileProgram(compileShader(UI_VERT, GL_VERTEX_SHADER), compileShader(UI_FRAG, GL_FRAGMENT_SHADER))
+    shader_fade = compileProgram(compileShader(UI_VERT, GL_VERTEX_SHADER), compileShader(FADE_FRAG, GL_FRAGMENT_SHADER))
     
     vao_hornet = carregar_modelo_completo("hornet.glb")
     vao_porta = carregar_modelo_completo("door.glb")
     vao_esfera, num_vert_esfera = criar_esfera_vao()
     vao_crosshair, num_vert_crosshair = criar_crosshair_vao()
     vao_ui = criar_ui_quad_vao()
+    
+    # Prepara a tela de FADE e a FOTO
+    vao_tela_cheia = criar_quad_generico_vao(1.0, 1.0)
+    tex_ivo, aspecto_ivo = carregar_textura_imagem("ivo.png")
+    # A foto ocupa 60% da altura da tela, ajustando a largura pelo aspect ratio original
+    vao_foto_ivo = criar_quad_generico_vao(0.6 * aspecto_ivo, 0.6) if tex_ivo else None
     
     glEnable(GL_DEPTH_TEST); glEnable(GL_CULL_FACE); glLineWidth(2.0)
     projection = pyrr.matrix44.create_perspective_projection_matrix(45.0, largura/altura, 0.1, 100.0)
@@ -207,22 +257,24 @@ def main():
     yaw, pitch, sensibilidade, speed = -90.0, 0.0, 0.1, 4.0
     pygame.mouse.get_rel() 
     
-    current_room = 0 # 0: Dream, 1: Battle, 2: Final
+    current_room = 0 # 0: Dream, 1: Battle, 2: Final, 3: Foto
     dialogo_ativo, num_inimigos_vivos = False, 0
+    fade_alpha = 0.0
+    fade_out_ativo = False
     clock = pygame.time.Clock(); running = True
 
     # --- LISTAS DE DIÁLOGO ---
     dialogos_inicio = [
-        "Pequeno inseto, a fundação está corrompida. Para consertar este mundo, você precisa me ajudar.",
-        "Atravesse aquela porta. O vazio está cheio de anomalias, bugs e falhas do passado.",
-        "Destrua todos os 40 alvos para provar que você é o verdadeiro arquiteto deste lugar!"
+        "Pequeno inseto, a fundacao esta corrompida. Para consertar este mundo, voce precisa me ajudar.",
+        "Atravesse aquela porta. O vazio esta cheio de anomalias, bugs e falhas do passado.",
+        "Destrua todos os 40 alvos para provar que voce e o verdadeiro arquiteto deste lugar!"
     ]
     
     dialogos_final = [
-        "Inacreditável... Você conseguiu derrotar todos os 40 ecos do passado.",
-        "O caminho até aqui não foi fácil. Foi necessário muita luta e foco inabalável.",
-        "Este pequeno jogo é a nossa forma de celebrar os seus 40 anos de vida e história.",
-        "É uma alegria gigantesca ter você conosco no VORTEX como nosso coordenador. Feliz Aniversário, Ivo!"
+        "Inacreditavel... Voce conseguiu derrotar todos os 40 ecos do passado.",
+        "O caminho ate aqui nao foi facil. Foi necessario muita luta e foco inabalavel.",
+        "Este pequeno jogo e a nossa forma de celebrar os seus 40 anos de vida e historia.",
+        "E uma alegria gigantesca ter voce conosco no VORTEX como nosso coordenador. Feliz Aniversario, Ivo!"
     ]
     
     dialogos_atuais = dialogos_inicio
@@ -252,7 +304,7 @@ def main():
                 running = False
             
             # --- INTERAÇÕES UNIVERSAIS NA TECLA E ---
-            elif event.type == KEYDOWN and event.key == K_e:
+            elif event.type == KEYDOWN and event.key == K_e and not fade_out_ativo:
                 dist_h = np.linalg.norm(cam_pos[[0,2]] - np.array([0.0, -5.0]))
                 dist_p = np.linalg.norm(cam_pos[[0,2]] - np.array([0.0, -25.0]))
                 
@@ -272,7 +324,10 @@ def main():
                 elif current_room == 2:
                     if dist_h < 8.0:
                         if dialogo_ativo:
-                            dialogo_ativo, char_index_di, current_di = False, 0, 0
+                            dialogo_ativo = False
+                            # SE ESTAVA NO ÚLTIMO DIÁLOGO E ELE FECHOU, INICIA O FADE OUT
+                            if current_di >= len(dialogos_atuais) - 1:
+                                fade_out_ativo = True
                         else:
                             dialogos_atuais = dialogos_final
                             dialogo_ativo, char_index_di, current_di, texto_atual_exibido = True, 0, 0, ""
@@ -298,7 +353,8 @@ def main():
                                     yaw, pitch = -90.0, 0.0
                                 break 
         
-        if not dialogo_ativo:
+        # Só permite girar e andar se o Fade Out e a Tela Final NÃO estiverem ativos
+        if not dialogo_ativo and current_room < 3 and not fade_out_ativo:
             dx, dy = pygame.mouse.get_rel()
             pygame.mouse.set_pos((largura//2, altura//2)) 
             pygame.mouse.get_rel() 
@@ -320,79 +376,111 @@ def main():
         glClearColor(1.0, 1.0, 1.0, 1.0); glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         view = pyrr.matrix44.create_look_at(cam_pos, cam_pos + cam_front, cam_up)
         
-        glUseProgram(shader_phong)
-        glUniformMatrix4fv(glGetUniformLocation(shader_phong, "projection"), 1, GL_FALSE, projection)
-        glUniformMatrix4fv(glGetUniformLocation(shader_phong, "view"), 1, GL_FALSE, view)
-        glUniform3f(glGetUniformLocation(shader_phong, "viewPos"), cam_pos[0], cam_pos[1], cam_pos[2])
-        
-        # SALA INICIAL
-        if current_room == 0:
-            glUniformMatrix4fv(glGetUniformLocation(shader_phong, "model"), 1, GL_FALSE, model_hornet)
-            for parte in vao_hornet:
-                glUniform3f(glGetUniformLocation(shader_phong, "objectColor"), 0.8, 0.1, 0.1) 
-                glBindVertexArray(parte['vao']); glDrawArrays(GL_TRIANGLES, 0, parte['count'])
-            
-            glUniformMatrix4fv(glGetUniformLocation(shader_phong, "model"), 1, GL_FALSE, model_porta)
-            for parte in vao_porta:
-                glUniform3f(glGetUniformLocation(shader_phong, "objectColor"), 0.5, 0.5, 0.6) 
-                glBindVertexArray(parte['vao']); glDrawArrays(GL_TRIANGLES, 0, parte['count'])
-            
-        # SALA DE BATALHA
-        elif current_room == 1:
-            for ini in inimigos:
-                if ini['alive']:
-                    glUniformMatrix4fv(glGetUniformLocation(shader_phong, "model"), 1, GL_FALSE, pyrr.matrix44.create_from_translation(ini['position']))
-                    glUniform3f(glGetUniformLocation(shader_phong, "objectColor"), 0.8, 0.1, 0.1)
-                    glBindVertexArray(vao_esfera); glDrawArrays(GL_TRIANGLES, 0, num_vert_esfera)
-
-            glUseProgram(shader_crosshair)
-            glBindVertexArray(vao_crosshair); glDrawArrays(GL_LINES, 0, num_vert_crosshair)
-            
-        # SALA FINAL DA HOMENAGEM
-        elif current_room == 2:
+        # === RENDERIZAÇÃO DO MUNDO 3D (Se não estiver na tela final) ===
+        if current_room < 3:
             glUseProgram(shader_phong)
-            glUniformMatrix4fv(glGetUniformLocation(shader_phong, "model"), 1, GL_FALSE, model_hornet)
-            for parte in vao_hornet:
-                glUniform3f(glGetUniformLocation(shader_phong, "objectColor"), 0.8, 0.1, 0.1) 
-                glBindVertexArray(parte['vao']); glDrawArrays(GL_TRIANGLES, 0, parte['count'])
+            glUniformMatrix4fv(glGetUniformLocation(shader_phong, "projection"), 1, GL_FALSE, projection)
+            glUniformMatrix4fv(glGetUniformLocation(shader_phong, "view"), 1, GL_FALSE, view)
+            glUniform3f(glGetUniformLocation(shader_phong, "viewPos"), cam_pos[0], cam_pos[1], cam_pos[2])
+            
+            # SALA INICIAL
+            if current_room == 0:
+                glUniformMatrix4fv(glGetUniformLocation(shader_phong, "model"), 1, GL_FALSE, model_hornet)
+                for parte in vao_hornet:
+                    glUniform3f(glGetUniformLocation(shader_phong, "objectColor"), 0.8, 0.1, 0.1) 
+                    glBindVertexArray(parte['vao']); glDrawArrays(GL_TRIANGLES, 0, parte['count'])
                 
-            glUseProgram(shader_crosshair)
-            glBindVertexArray(vao_crosshair); glDrawArrays(GL_LINES, 0, num_vert_crosshair)
+                glUniformMatrix4fv(glGetUniformLocation(shader_phong, "model"), 1, GL_FALSE, model_porta)
+                for parte in vao_porta:
+                    glUniform3f(glGetUniformLocation(shader_phong, "objectColor"), 0.5, 0.5, 0.6) 
+                    glBindVertexArray(parte['vao']); glDrawArrays(GL_TRIANGLES, 0, parte['count'])
+                
+            # SALA DE BATALHA
+            elif current_room == 1:
+                for ini in inimigos:
+                    if ini['alive']:
+                        glUniformMatrix4fv(glGetUniformLocation(shader_phong, "model"), 1, GL_FALSE, pyrr.matrix44.create_from_translation(ini['position']))
+                        glUniform3f(glGetUniformLocation(shader_phong, "objectColor"), 0.8, 0.1, 0.1)
+                        glBindVertexArray(vao_esfera); glDrawArrays(GL_TRIANGLES, 0, num_vert_esfera)
 
-        # LÓGICA DE UI APLICADA ÀS SALAS 0 E 2
-        if dialogo_ativo and (current_room == 0 or current_room == 2):
-            time_di += dt
-            texto_real = dialogos_atuais[current_di]
-            
-            if time_di > 0.04 and char_index_di < len(texto_real): 
-                texto_atual_exibido += texto_real[char_index_di]
-                if textura_ui is not None: glDeleteTextures(1, [textura_ui]) 
-                textura_ui = gerar_textura_texto(texto_atual_exibido, fonte_ui)
+                glUseProgram(shader_crosshair)
+                glBindVertexArray(vao_crosshair); glDrawArrays(GL_LINES, 0, num_vert_crosshair)
                 
-                # Escolhe o som correto dependendo da sala
-                som_atual = dialogo_blip_inicio if current_room == 0 else dialogo_blip_final
+            # SALA FINAL DA HOMENAGEM
+            elif current_room == 2:
+                glUseProgram(shader_phong)
+                glUniformMatrix4fv(glGetUniformLocation(shader_phong, "model"), 1, GL_FALSE, model_hornet)
+                for parte in vao_hornet:
+                    glUniform3f(glGetUniformLocation(shader_phong, "objectColor"), 0.8, 0.1, 0.1) 
+                    glBindVertexArray(parte['vao']); glDrawArrays(GL_TRIANGLES, 0, parte['count'])
+                    
+                glUseProgram(shader_crosshair)
+                glBindVertexArray(vao_crosshair); glDrawArrays(GL_LINES, 0, num_vert_crosshair)
+
+            # LÓGICA DE UI APLICADA ÀS SALAS 0 E 2
+            if dialogo_ativo and (current_room == 0 or current_room == 2):
+                time_di += dt
+                texto_real = dialogos_atuais[current_di]
                 
-                if texto_real[char_index_di] != " " and som_atual is not None:
-                    if not pygame.mixer.Channel(0).get_busy():
-                        pygame.mixer.Channel(0).play(som_atual)
+                if time_di > 0.04 and char_index_di < len(texto_real): 
+                    texto_atual_exibido += texto_real[char_index_di]
+                    if textura_ui is not None: glDeleteTextures(1, [textura_ui]) 
+                    textura_ui = gerar_textura_texto(texto_atual_exibido, fonte_ui)
+                    
+                    # Escolhe o som correto dependendo da sala
+                    som_atual = dialogo_blip_inicio if current_room == 0 else dialogo_blip_final
+                    
+                    if texto_real[char_index_di] != " " and som_atual is not None:
+                        if not pygame.mixer.Channel(0).get_busy():
+                            pygame.mixer.Channel(0).play(som_atual)
+                    
+                    char_index_di += 1; time_di = 0.0
+                    
+                elif char_index_di == len(texto_real) and time_di > 1.0: 
+                    if current_di + 1 < len(dialogos_atuais):
+                        current_di += 1; char_index_di, time_di, texto_atual_exibido = 0, 0.0, ""
+                    else: 
+                        dialogo_ativo = False 
+                        # Gatilho do Fade Out na Sala 2
+                        if current_room == 2:
+                            fade_out_ativo = True
                 
-                char_index_di += 1; time_di = 0.0
+                if textura_ui is not None:
+                    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); glDisable(GL_DEPTH_TEST) 
+                    glUseProgram(shader_ui); glBindTexture(GL_TEXTURE_2D, textura_ui); glBindVertexArray(vao_ui)
+                    glDrawArrays(GL_QUADS, 0, 4)
+                    glEnable(GL_DEPTH_TEST); glDisable(GL_BLEND)
+
+        # === EFEITO DE FADE E TELA FINAL 2D ===
+        if fade_out_ativo:
+            fade_alpha += dt * 0.4 # Velocidade do escurecimento
+            if fade_alpha >= 1.0:
+                fade_alpha = 1.0
+                current_room = 3 # Pula pra tela da foto
+                fade_out_ativo = False
                 
-            elif char_index_di == len(texto_real) and time_di > 1.0: 
-                if current_di + 1 < len(dialogos_atuais):
-                    current_di += 1; char_index_di, time_di, texto_atual_exibido = 0, 0.0, ""
-                else: 
-                    dialogo_ativo = False 
-            
-            if textura_ui is not None:
+        # Se chegou na tela final (Sala 3), a tela fica toda preta e mostra a foto
+        if current_room == 3:
+            glClearColor(0.0, 0.0, 0.0, 1.0)
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+            if tex_ivo is not None and vao_foto_ivo is not None:
                 glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); glDisable(GL_DEPTH_TEST) 
-                glUseProgram(shader_ui); glBindTexture(GL_TEXTURE_2D, textura_ui); glBindVertexArray(vao_ui)
+                glUseProgram(shader_ui); glBindTexture(GL_TEXTURE_2D, tex_ivo); glBindVertexArray(vao_foto_ivo)
                 glDrawArrays(GL_QUADS, 0, 4)
                 glEnable(GL_DEPTH_TEST); glDisable(GL_BLEND)
+        
+        # Desenha a película preta por cima do 3D se o fade estiver rolando
+        elif fade_alpha > 0.0:
+            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); glDisable(GL_DEPTH_TEST)
+            glUseProgram(shader_fade)
+            glUniform1f(glGetUniformLocation(shader_fade, "alpha"), fade_alpha)
+            glBindVertexArray(vao_tela_cheia)
+            glDrawArrays(GL_QUADS, 0, 4)
+            glEnable(GL_DEPTH_TEST); glDisable(GL_BLEND)
 
         pygame.display.flip()
 
     pygame.quit(); sys.exit()
 
 if __name__ == "__main__":
-    main()
+    main()      
